@@ -1,0 +1,9 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# 量測資料與連線測試輸出（含儀器序號）
+data/
+test_log.txt
+scope_raw_ch1.bin
