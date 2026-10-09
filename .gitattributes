@@ -1,0 +1,3 @@
+# Windows 批次檔必須是 CRLF 換行，否則 cmd 會讀錯（尤其含中文時）。
+# -text：原封不動存進 repo，從 GitHub 下載 ZIP 也保持 CRLF。
+*.bat -text

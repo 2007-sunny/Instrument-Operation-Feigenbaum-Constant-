@@ -1,43 +1,131 @@
 # 示波器 / 函數產生器 控制台
 
-GW Instek **GDS-1072B** 示波器 + **AFG-2112** 函數產生器，透過 USB 在電腦上：
+GW Instek **GDS-1072B** 示波器 + **AFG-2112** 函數產生器，透過 USB 在電腦上操作與分析：
 
-- 即時顯示 CH1 / CH2 波形，並自動算 Vpp、頻率、平均值、**CH2/CH1 增益與相位差**
-- 一鍵儲存波形（CSV + PNG 截圖），CSV 可直接用 Excel / Python 開
-- 設定產生器：波形、頻率（含 ×2 ÷2 ×10 ÷10 快速鍵）、振幅、偏移、輸出開關
-- **自動掃頻 → 波德圖**（增益 dB、相位），並估算 −3 dB 頻率，可存 CSV + PNG
-- **模擬模式**：不接儀器也能試用（模擬 CH2 接了一個截止頻率 1 kHz 的 RC 低通濾波器）
+- **即時波形**：CH1 / CH2，自動算 Vpp、頻率、平均值、CH2/CH1 增益與相位差；時間 / 電壓游標、框選放大
+- **頻譜 FFT**：峰值列表、dBc、THD、多種視窗、平均
+- **儲存**：波形、頻譜、掃頻結果都能存成 CSV + PNG，CSV 可直接用 Excel / Python 開
+- **函數產生器控制**：波形、頻率、振幅、偏移、負載（50 Ω / High-Z）、輸出開關
+- **共振掃頻**：往上 / 往下 / 往上再往下（檢查遲滯）、自動兩階段細掃，自動算 f_res、Q、C_eff
+- **批次掃描**：對一串振幅或 DC offset 各做一次掃頻，輸出總表與 f_res 圖
+- **分岔圖**：固定頻率加大振幅，自動判斷週期 1 / 2 / 4 / 8 / 混沌
+- **模擬模式**：不接儀器也能試用全部功能（模擬串聯 RLC 共振電路與倍週期分岔）
 
-## 檔案
+---
 
-| 檔案 | 用途 |
-|---|---|
-| `app.py` | 主程式（圖形介面） |
-| `start.bat` / `start_sim.bat` | 雙擊啟動 / 以模擬模式啟動 |
-| `test_connection.py` | 第一次接儀器時的連線測試（只查詢，不改設定） |
-| `instruments.py` | 儀器指令（SCPI）與模擬器 |
-| `analysis.py` | 頻率估計、鎖相分析（振幅/相位） |
-| `config.py` | 可調整的設定 |
+## 下載與安裝（第一次使用請照著做）
 
-## 第一次使用
+> 只支援 **Windows 10 / 11**。全部做完大約 10 分鐘。
 
-1. **建立虛擬環境 `.venv`**（這台電腦已建好；換電腦時在本資料夾執行）：
+### 步驟 1　安裝 Python（已經有就跳過）
+
+1. 到 <https://www.python.org/downloads/> 下載 **Python 3.10 ~ 3.13**（3.11、3.13 都測試過）。
+2. 執行安裝程式，**第一個畫面最下面一定要勾選「Add python.exe to PATH」**，再按「Install Now」。
+   - 學校電腦沒有管理員權限也沒關係，Install Now 只會裝在你自己的帳號底下。
+3. 檢查有沒有裝好：按 `Win` 鍵，輸入 `cmd` 開啟「命令提示字元」，輸入
    ```
-   python -m venv .venv
-   .venv\Scripts\python.exe -m pip install -r requirements.txt -i https://pypi.tuna.tsinghua.edu.cn/simple
+   python --version
    ```
-   `start.bat` / `start_sim.bat` 會自動使用 `.venv`；手動執行時請用 `.venv\Scripts\python.exe`
-   （例如 `.venv\Scripts\python.exe test_connection.py`）。
-2. **安裝 USB 驅動**：到 GW Instek 官網下載 GDS-1000B 與 AFG-2100 系列的 USB 驅動並安裝。
-   接上 USB 後，在「裝置管理員 → 連接埠 (COM 和 LPT)」應該會看到兩個 COM 埠。
-3. **示波器設定**：若面板 Utility → I/O 有 USB Device 模式選項，選擇電腦連線模式。
-4. **跑連線測試**：
+   看到 `Python 3.xx.x` 就成功了。
+
+### 步驟 2　下載本程式
+
+**方法 A：下載 ZIP（最簡單，不需要會 Git）**
+
+1. 打開本頁 <https://github.com/2007-sunny/Instrument-Operation-Feigenbaum-Constant->
+2. 按綠色的 **「<> Code」** 按鈕 → **「Download ZIP」**。
+3. 對下載的 ZIP 按右鍵 → **「解壓縮全部」**，放到你想放的地方（例如 `D:\實驗\儀器程式`）。
+   - ⚠ **一定要先解壓縮**，不要直接在 ZIP 裡面雙擊檔案執行。
+   - 資料夾路徑有中文沒關係。
+
+**方法 B：用 Git（之後更新比較方便）**
+
+```
+git clone https://github.com/2007-sunny/Instrument-Operation-Feigenbaum-Constant-.git
+```
+
+### 步驟 3　安裝需要的套件
+
+在解壓縮後的資料夾裡，**雙擊 `install.bat`**。它會自動：
+
+1. 找到你電腦上的 Python
+2. 在資料夾裡建立一個獨立的環境 `.venv`（不會影響電腦上其他 Python 程式）
+3. 下載安裝 PyQt5、pyqtgraph、numpy、pyserial（約 100 MB，需要網路，大約 1 ~ 5 分鐘）
+
+最後看到「**安裝完成！**」就好了。
+
+- 第一次雙擊 `.bat` 時，Windows 可能跳出藍色的「Windows 已保護您的電腦」→ 按「**其他資訊**」→「**仍要執行**」。
+- 下載很慢或失敗時，`install.bat` 會自動改用清華大學鏡像站再試一次。
+
+<details>
+<summary>不想用 install.bat，想自己打指令？</summary>
+
+在本資料夾開啟命令提示字元（在檔案總管的網址列輸入 `cmd` 按 Enter），依序執行：
+
+```
+python -m venv .venv
+.venv\Scripts\python.exe -m pip install -r requirements.txt
+```
+下載太慢可在第二行最後加上 `-i https://pypi.tuna.tsinghua.edu.cn/simple`。
+</details>
+
+### 步驟 4　先用模擬模式試用（不用接儀器）
+
+雙擊 **`start_sim.bat`**，會開啟程式並連上模擬的儀器，所有功能都能先玩看看。
+
+### 步驟 5　接上真的儀器
+
+1. 用 USB 線把**示波器和函數產生器都接到電腦**（儀器背面的 USB Device 方形孔）。
+2. **驅動程式**：Windows 10 / 11 通常會自動辨識。打開「裝置管理員」→「連接埠 (COM 和 LPT)」，
+   看到兩個「USB 序列裝置 (COMx)」就可以了。
+   如果出現黃色驚嘆號，請到 [GW Instek 官網](https://www.gwinstek.com/) 搜尋 GDS-1000B、AFG-2100 下載 USB 驅動。
+3. 示波器若在 Utility → I/O 有 USB Device 模式選項，選擇電腦連線（CDC）模式。
+4. **第一次接儀器先跑連線測試**（只會讀取，不會改任何儀器設定）：在本資料夾開啟命令提示字元，輸入
    ```
    .venv\Scripts\python.exe test_connection.py
    ```
-   會自動偵測兩台儀器、讀一次波形、比對電壓換算是否正確，結果存在 `test_log.txt`。
-   如果出現 ✘，照著提示改 `config.py`，或把 `test_log.txt` 貼給 Claude 修正。
-5. **啟動**：雙擊 `start.bat`，選好 COM 埠（或按「自動偵測」）→「連線」。
+   結果會顯示在畫面上並存成 `test_log.txt`。想順便檢查電壓換算是否正確，用 BNC 線 + T 型接頭把產生器輸出同時接到 CH1 與 CH2，再執行
+   ```
+   .venv\Scripts\python.exe test_connection.py --calibrate
+   ```
+   （這個會改變儀器設定：產生器輸出 1 kHz 正弦波、示波器按 AUTOSET。）每一項都是 ✔ 就沒問題。
+5. 雙擊 **`start.bat`** → 按「**自動偵測**」→「**連線**」，就會開始顯示即時波形。
+
+> 同一時間只能有一個程式連著儀器。開著 `start.bat` 的時候不能跑 `test_connection.py`，反之亦然。
+
+### 之後要更新到新版
+
+- **用 ZIP 下載的**：重新下載 ZIP、解壓縮到新資料夾，再雙擊 `install.bat`。
+  舊資料夾裡的 `data\`（你存的量測資料）和自己改過的 `config.py` 記得複製過去。
+- **用 Git 的**：在資料夾裡執行 `git pull`，再雙擊一次 `install.bat`。
+
+### 安裝常見問題
+
+| 狀況 | 解決方法 |
+|---|---|
+| `install.bat` 說「找不到 Python」 | Python 安裝時沒勾「Add python.exe to PATH」。重新執行 Python 安裝程式 → Modify → 勾選 Add Python to environment variables；或解除安裝後重裝並記得勾選 |
+| 雙擊 `.bat` 視窗一閃就關掉 | 確認已經**解壓縮**，不是在 ZIP 裡面執行；也可以在命令提示字元裡執行它看完整訊息 |
+| 雙擊 `start.bat` 沒反應或出錯 | 先執行 `install.bat`。若視窗停住顯示錯誤，把訊息截圖給會用的人 |
+| 套件下載很慢 / 失敗 | 換個網路（例如手機熱點）再雙擊一次 `install.bat`；它會自動改用鏡像站 |
+| 找不到 COM 埠 | USB 線要能傳資料（有些線只能充電）；檢查裝置管理員；換一個 USB 孔 |
+| 連線失敗「存取被拒」 | COM 埠被其他程式佔用：關掉其他開著的本程式、`test_connection.py` 或原廠軟體 |
+
+---
+
+## 檔案說明
+
+| 檔案 | 用途 |
+|---|---|
+| `install.bat` | 第一次使用：自動建立環境、安裝套件 |
+| `start.bat` / `start_sim.bat` | 啟動程式 / 以模擬模式啟動 |
+| `test_connection.py` | 連線測試與電壓校正 |
+| `app.py` | 主程式（圖形介面） |
+| `experiments.py`、`experiments_ui.py` | 掃頻、批次掃描、分岔圖的流程與介面 |
+| `instruments.py` | 儀器指令（SCPI）與模擬器 |
+| `analysis.py` | 頻率估計、鎖相分析、FFT、共振分析、週期判斷 |
+| `config.py` | 可調整的設定（COM 埠、安全上限、模擬參數…） |
+
+存下來的資料預設放在 `data\` 資料夾。
 
 ## 波形畫面操作（游標）
 
@@ -126,15 +214,15 @@ AFG 輸出 ──┬──> 待測電路輸入 ──> 電路輸出 ──> CH2
 - 掃頻時程式會自動調整時基與垂直刻度；每一點會先讓示波器 STOP 再讀兩個通道，確保是同一次擷取
 - 相位差定義為 φ(CH2) − φ(CH1)，低通濾波器會是負值（輸出落後）
 
-## 常見問題
+## 使用時常見問題
 
-- **找不到 COM 埠**：驅動沒裝好，或 USB 線只有充電功能。
 - **讀波形逾時**：確認通道有開；把 `config.py` 的 `TIMEOUT_S` 調大；`RECORD_LENGTH` 保持 1000。
 - **存下的電壓和螢幕不一樣**：照 `test_connection.py` 的建議修改 `COUNTS_PER_DIV`。
 - **更新率很慢**：USB 虛擬 COM 埠傳輸有限，每秒數張屬正常；只開一個通道會快一些。
-- **產生器振幅和示波器量到的差兩倍**：產生器負載設定為 50 Ω 但接的是高阻抗，在產生器面板把負載改成 High-Z。
+- **產生器振幅和示波器量到的差兩倍**：產生器負載設定為 50 Ω 但接的是高阻抗，在程式的「產生器」分頁把「負載設定」改成 High-Z。
 
 ## 備註
 
 GDS-1000B 讀波形的資料格式（標頭欄位、每格 count 數）是依官方 Programming Manual 的格式撰寫，
-第一次接真實儀器時請務必先跑 `test_connection.py` 確認。
+已在 GDS-1072B（韌體 V1.21）+ AFG-2112（V2.04）上校正確認（`COUNTS_PER_DIV = 25`、`SUBTRACT_POSITION = False`）。
+其他型號或韌體版本，第一次使用請先跑 `test_connection.py --calibrate` 確認。
