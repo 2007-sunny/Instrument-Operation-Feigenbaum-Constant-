@@ -32,9 +32,9 @@ LIVE_INTERVAL_S = 0.05   # 每次讀完波形後的最短間隔（秒）
 DATA_DIR = "data"        # 預設儲存資料夾（相對於本程式所在位置）
 
 # 頻寬限制的指令參數（:CHANnel<n>:BWLimit <值>）。
-# 若示波器不接受，執行 test_connection.py 看 :CHANnel1:BWLimit? 回傳什麼，照格式修改。
-BWLIMIT_ON = "ON"
-BWLIMIT_OFF = "OFF"
+# GDS-1072B（V1.21）實測：20E+6 = 開（20 MHz），FULL = 關；"OFF" 不被接受。
+BWLIMIT_ON = "20E+6"
+BWLIMIT_OFF = "FULL"
 
 # ---- 安全限制（產生器）----
 AMPLITUDE_MAX_VPP = 5.0    # 振幅上限（MV2109 反向耐壓 30 V；4 Vpp 時二極體已擺到約 −12.5 V）

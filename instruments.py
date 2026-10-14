@@ -28,7 +28,18 @@ AFG_FREQ_RANGE = (0.1, 12e6)    # AFG-2112：0.1 Hz ~ 12 MHz（正弦/方波）
 
 
 def list_com_ports():
-    return [(p.device, p.description) for p in list_ports.comports()]
+    """回傳 [(埠, 說明)]，USB（GW Instek 優先）排前面、藍牙排最後。"""
+    def key(p):
+        return (p.vid is None, p.vid != GW_INSTEK_VID, p.device)
+    out = []
+    for p in sorted(list_ports.comports(), key=key):
+        desc = p.description
+        if p.vid == GW_INSTEK_VID:
+            desc = f"GW Instek USB — {desc}"
+        elif "BTHENUM" in (p.hwid or "").upper():
+            desc = f"藍牙（不是儀器）— {desc}"
+        out.append((p.device, desc))
+    return out
 
 
 @dataclass
@@ -302,27 +313,47 @@ class AFG2100(SerialInstrument):
         return self.query("SYST:ERR?")
 
 
-def auto_detect(ports=None):
-    """對每個 COM 埠送 *IDN?，找出示波器與函數產生器。回傳 {'scope': (port, idn), 'afg': (...)}"""
-    found = {}
-    for port in ports or [p for p, _ in list_com_ports()]:
-        try:
-            s = serial.Serial(port, config.BAUDRATE, timeout=0.8)
-        except Exception:
-            continue
-        try:
-            s.reset_input_buffer()
-            s.write(b"*IDN?\n")
-            idn = s.readline().decode("ascii", errors="replace").strip()
-        except Exception:
-            idn = ""
-        finally:
-            s.close()
-        up = idn.upper()
+GW_INSTEK_VID = 0x2184
+
+
+def candidate_ports():
+    """可能是儀器的 COM 埠：只取 USB 裝置（GW Instek 的排最前面），略過藍牙序列埠。
+    藍牙序列埠一打開就會嘗試連線配對的裝置，可能卡住很久。"""
+    usb = [p for p in list_ports.comports() if p.vid is not None]
+    usb.sort(key=lambda p: (p.vid != GW_INSTEK_VID, p.device))
+    return [p.device for p in usb]
+
+
+def _probe_idn(port, result):
+    try:
+        s = serial.Serial(port, config.BAUDRATE, timeout=0.8)
+    except Exception:
+        return
+    try:
+        s.reset_input_buffer()
+        s.write(b"*IDN?\n")
+        result[port] = s.readline().decode("ascii", errors="replace").strip()
+    except Exception:
+        pass
+    finally:
+        s.close()
+
+
+def auto_detect(ports=None, per_port_timeout=2.0):
+    """對每個候選 COM 埠送 *IDN?，找出示波器與函數產生器。回傳 {'scope': (port, idn), 'afg': (...)}
+    每個埠最多等 per_port_timeout 秒，卡住的埠直接略過。"""
+    found, result = {}, {}
+    for port in ports or candidate_ports():
+        th = threading.Thread(target=_probe_idn, args=(port, result), daemon=True)
+        th.start()
+        th.join(per_port_timeout)
+        up = result.get(port, "").upper()
         if "GDS" in up:
-            found["scope"] = (port, idn)
+            found["scope"] = (port, result[port])
         elif "AFG" in up or "SFG" in up:
-            found["afg"] = (port, idn)
+            found["afg"] = (port, result[port])
+        if "scope" in found and "afg" in found:
+            break
     return found
 
 
