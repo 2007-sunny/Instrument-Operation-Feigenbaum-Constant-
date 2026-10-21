@@ -216,6 +216,7 @@ class MainWindow(ExperimentsMixin, QtWidgets.QMainWindow):
         self.plot_tabs.addTab(self._build_bode_tab(), "波德圖")
         self.plot_tabs.addTab(self._build_param_plot_tab(), "參數掃描")
         self.plot_tabs.addTab(self._build_bif_plot_tab(), "分岔圖")
+        self.plot_tabs.addTab(self._build_feig_tab(), "分岔分析")
         return self.plot_tabs
 
     def _build_fft_tab(self):
@@ -366,7 +367,11 @@ class MainWindow(ExperimentsMixin, QtWidgets.QMainWindow):
         self.btn_single.clicked.connect(lambda: self._scope_cmd("single"))
         self.btn_autoset.clicked.connect(self.on_autoset)
         form.addRow("示波器", hbox(self.btn_run, self.btn_stop, self.btn_single))
-        form.addRow("", hbox(self.btn_autoset, "stretch"))
+        self.btn_pos0 = QtWidgets.QPushButton("垂直位置歸零")
+        self.btn_pos0.setToolTip("把 CH1、CH2 的垂直位置設為 0 V。\n位置不是 0 時，小訊號可能被推到螢幕邊緣，自動刻度也無法縮小。")
+        self.btn_pos0.clicked.connect(lambda: [self._scope_set("set_position", ch, 0.0) for ch in (1, 2)])
+        self.scope_setting_widgets.append(self.btn_pos0)
+        form.addRow("", hbox(self.btn_autoset, self.btn_pos0, "stretch"))
 
         tip = QtWidgets.QLabel("提示：即時顯示的更新率受 USB 傳輸速度限制，約每秒數張。"
                                "記錄長度可在 config.py 的 RECORD_LENGTH 調整。")
@@ -990,6 +995,9 @@ class MainWindow(ExperimentsMixin, QtWidgets.QMainWindow):
             self.afg.set_frequency(f)
             self.afg.set_amplitude(self.spn_amp.value())
             self.afg.set_offset(self.spn_off.value())
+            err = self.afg.check_error() if hasattr(self.afg, "check_error") else None
+            if err:
+                QtWidgets.QMessageBox.warning(self, "產生器回報錯誤", f"產生器拒絕了部分設定：{err}\n請確認數值在產生器允許的範圍內。")
             self.statusBar().showMessage(
                 f"產生器：{self.cmb_func.currentText()} {fmt_eng(f, 'Hz')}，{self.spn_amp.value():g} Vpp，偏移 {self.spn_off.value():g} V")
         except ValueError as e:
@@ -1051,8 +1059,11 @@ class MainWindow(ExperimentsMixin, QtWidgets.QMainWindow):
         return d
 
     def _base_name(self, prefix):
+        """單張波形、FFT 的檔名：<儲存資料夾>/<config.WAVE_SUBDIR>/<prefix>_<時間>。"""
+        d = os.path.join(self._ensure_dir(), config.WAVE_SUBDIR)
+        os.makedirs(d, exist_ok=True)
         stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        return os.path.join(self._ensure_dir(), f"{prefix}_{stamp}")
+        return os.path.join(d, f"{prefix}_{stamp}")
 
     def _meta_lines(self):
         lines = [f"# 儲存時間,{datetime.datetime.now().isoformat(timespec='seconds')}"]

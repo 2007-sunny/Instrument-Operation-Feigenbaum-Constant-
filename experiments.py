@@ -3,6 +3,7 @@
 - 批次參數掃描：對每個振幅（或 DC offset）各做一次掃頻，輸出總表
 - 分岔圖：固定頻率逐步加大振幅，每週期取一個值，判斷週期 1 / 2 / 4 / 8 / 混沌
 """
+import cmath
 import copy
 import csv
 import math
@@ -14,7 +15,11 @@ import numpy as np
 from PyQt5 import QtCore
 
 import config
-from analysis import (analyze_resonance, detect_period, fmt_eng, lockin, per_cycle_values, period_label, pick_scale,
+from analysis import (POW2_ORDERS, amplitude_rel_error, analyze_resonance, branch_stats, classify_period,
+                      detect_period, feigenbaum_analysis, fmt_eng, lockin, lyapunov_kantz, SPEC_GRID,
+                      spectrum_map_row,
+                      per_cycle_values,
+                      period_label, pick_scale,
                       subharmonic_dbc, suggest_vscale, vpp, wrap_deg)
 from instruments import AFG_FREQ_RANGE, TIME_SCALES, VOLT_SCALES
 
@@ -39,8 +44,8 @@ class SweepSettings:
     periods: float = 4.0          # 畫面上顯示幾個週期
     settle: float = 0.5           # 每點等待 (s)
     auto_v: bool = True
-    sw_avg: int = 1               # 程式平均：每點讀幾次再平均
-    scope_avg: int = 1            # 示波器硬體平均次數（1 = 關）
+    sw_avg: int = config.DEFAULT_SW_AVG   # 程式平均：每點讀幾張，各自鎖相後平均（不受觸發抖動影響）
+    scope_avg: int = config.DEFAULT_SCOPE_AVG   # 示波器硬體平均次數（1 = 關）
     auto_ac: bool = False         # 開始前設 AC 耦合、關頻寬限制
     L: float = config.DEFAULT_L_UH * 1e-6
     stop_action: str = "keep"
@@ -95,26 +100,6 @@ class Measurer:
         finally:
             self.scope.run()
 
-    def acquire_avg(self, n, gap):
-        """讀 n 次，波形逐點平均（觸發在 CH1，所以每次的相位一致）。"""
-        w1, w2 = self.acquire()
-        if n <= 1:
-            return w1, w2
-        s1, s2 = [w1], [w2]
-        for _ in range(n - 1):
-            self.wait(gap)
-            a, b = self.acquire()
-            if len(a.v) == len(w1.v) and len(b.v) == len(w2.v):
-                s1.append(a)
-                s2.append(b)
-        out = []
-        for lst in (s1, s2):
-            w = copy.copy(lst[-1])
-            w.v = np.mean([x.v for x in lst], axis=0)
-            w.screen_div = np.mean([x.screen_div for x in lst], axis=0)
-            out.append(w)
-        return out[0], out[1]
-
     def measure(self, f, direction, stage):
         s = self.s
         self.afg.set_frequency(f)
@@ -124,7 +109,7 @@ class Measurer:
         wait = s.settle + 2 * frame + (s.scope_avg * frame if s.scope_avg > 1 else 0)
         self.wait(wait)
         for _ in range(6):
-            w1, w2 = self.acquire_avg(s.sw_avg, frame)
+            w1, w2 = self.acquire()
             if not s.auto_v:
                 break
             changed = False
@@ -136,18 +121,62 @@ class Measurer:
             if not changed:
                 break
             self.wait(wait)
-        a1, p1 = lockin(w1.t, w1.v, f)
-        a2, p2 = lockin(w2.t, w2.v, f)
+        frames = [(w1, w2)]
+        for _ in range(max(int(s.sw_avg), 1) - 1):
+            self.wait(frame)
+            frames.append(self.acquire())
+
+        # 資料不完整的張數（傳輸掉了一塊）：有完整的就只用完整的；全部不完整才標記，留待掃描結束後補測
+        good = [fr for fr in frames if not (fr[0].incomplete or fr[1].incomplete)]
+        incomplete = not good
+        if good:
+            frames = good
+            w1, w2 = frames[-1]
+
+        # 程式平均：每一張各自做鎖相，CH2 以同一張 CH1 的相位為基準再平均。
+        # 小訊號時觸發會抖動（實測每張相位差到 ±35°），直接把波形逐點平均會讓振幅變小；
+        # 這樣做則振幅、增益、相位都不受觸發抖動影響。
+        amp1, rel2 = [], []
+        for a, b in frames:
+            a1_, p1_ = lockin(a.t, a.v, f)
+            a2_, p2_ = lockin(b.t, b.v, f)
+            amp1.append(a1_)
+            rel2.append(a2_ * cmath.exp(1j * (p2_ - p1_)))
+        amp1, rel2 = np.array(amp1), np.array(rel2)
+        n = len(frames)
+        a1 = float(np.mean(amp1))
+        h = complex(np.mean(rel2))
+        a2 = abs(h)
         ok = a1 > 0 and a2 > 0
+        if n >= 3:       # 用張與張之間的離散程度估計誤差
+            err1 = float(np.std(amp1, ddof=1) / math.sqrt(n) / a1) if a1 > 0 else float("inf")
+            err2 = float(math.sqrt(np.sum(np.abs(rel2 - h) ** 2) / (n - 1)) / math.sqrt(n) / a2) if a2 > 0 \
+                else float("inf")
+        else:            # 張數太少：用殘差雜訊估計
+            err1 = amplitude_rel_error(w1.t, w1.v, f) / math.sqrt(n)
+            err2 = amplitude_rel_error(w2.t, w2.v, f) / math.sqrt(n)
         div1 = 2 * a1 / w1.vscale if w1.vscale else 0.0
         div2 = 2 * a2 / w2.vscale if w2.vscale else 0.0
+        clip = max(float(np.mean(np.abs(w.screen_div) >= config.ADC_LIMIT_DIVS)) for w in (w1, w2))
+        reasons = []
+        if not ok:
+            reasons.append("沒有訊號")
+        for name, err, div in (("CH1", err1, div1), ("CH2", err2, div2)):
+            if not err <= config.MAX_REL_ERROR:
+                reasons.append(f"{name} 誤差 {err * 100:.0f}%")
+            elif div < config.MIN_SIGNAL_DIVS:
+                reasons.append(f"{name} 只有 {div:.2f} 格")
+        if clip > 0.01:
+            reasons.append(f"波形超出範圍 {clip * 100:.0f}%")
+        if incomplete:
+            reasons.append("資料不完整（傳輸遺失）")
         return dict(
             freq_Hz=float(f), direction=direction, stage=stage,
             gain_dB=20 * math.log10(a2 / a1) if ok else float("nan"),
-            phase_deg=wrap_deg(math.degrees(p2 - p1)) if ok else float("nan"),
+            phase_deg=wrap_deg(math.degrees(cmath.phase(h))) if ok else float("nan"),
             CH1_amp_V=a1, CH2_amp_V=a2, CH1_Vpp=2 * a1, CH2_Vpp=2 * a2,
-            CH1_div_pp=div1, CH2_div_pp=div2,
-            unreliable=bool(not ok or div1 < config.SMALL_SIGNAL_DIVS or div2 < config.SMALL_SIGNAL_DIVS))
+            CH1_div_pp=div1, CH2_div_pp=div2, CH1_rel_err=err1, CH2_rel_err=err2, n_frames=n,
+            unreliable=bool(reasons), unreliable_reason="；".join(reasons), incomplete=incomplete, redone=False)
 
 
 def run_resonance_sweep(meas, s, extra, on_point, on_status):
@@ -187,6 +216,23 @@ def run_resonance_sweep(meas, s, extra, on_point, on_status):
         freqs = make_freqs(s.f_start, s.f_stop, s.n_coarse, s.spacing)
         for k, d in enumerate(dirs):
             sweep(freqs, d, "掃描", k > 0)
+
+    # 補測資料不完整的點：先停在掃描方向的前一側，再回到該頻率重量，結果取代原本的點
+    for rnd in range(config.REDO_ROUNDS if config.AUTO_REDO_INCOMPLETE else 0):
+      bad = [i for i, p in enumerate(pts) if p.get("incomplete")]
+      if not bad:
+          break
+      for k, i in enumerate(bad):
+        old = pts[i]
+        f, d = old["freq_Hz"], old["direction"]
+        on_status(f"補測資料不完整的點 {fmt_eng(f, 'Hz')}（{k + 1}/{len(bad)}）")
+        meas.afg.set_frequency(float(np.clip(f * (0.99 if d == "up" else 1.01), *AFG_FREQ_RANGE)))
+        meas.wait(max(s.settle, 0.2))
+        p = meas.measure(f, d, old["stage"])
+        p.update(extra)
+        p["redone"], p["redo_of"] = True, i
+        pts[i] = p
+        on_point(p)
     return pts, analyze_points(pts, s.L)
 
 
@@ -221,7 +267,8 @@ def amplitude_check(pts):
 # ======================================================================
 
 POINT_FIELDS = ["freq_Hz", "direction", "stage", "gain_dB", "phase_deg", "CH1_amp_V", "CH2_amp_V", "CH1_Vpp",
-                "CH2_Vpp", "CH1_div_pp", "CH2_div_pp", "AFG_set_Vpp", "AFG_offset_V", "AFG_load", "unreliable"]
+                "CH2_Vpp", "CH1_div_pp", "CH2_div_pp", "CH1_rel_err", "CH2_rel_err", "n_frames", "AFG_set_Vpp", "AFG_offset_V",
+                "AFG_load", "unreliable", "unreliable_reason", "incomplete", "redone"]
 
 
 def _fmt(x):
@@ -254,6 +301,8 @@ def write_sweep_csv(path, pts, analyses, meta_lines, s, warning=None):
         fp.write("# 掃描設定," + "；".join(f"{k}={v}" for k, v in asdict(s).items()) + "\n")
         for line in analysis_lines(analyses):
             fp.write(line + "\n")
+        if s.scope_avg > 1:
+            fp.write("# 注意,使用示波器平均時若觸發不穩，CH1/CH2 的絕對振幅可能偏小；增益與相位不受影響\n")
         if warning:
             fp.write(f"# 警告,{warning}\n")
         fields = POINT_FIELDS + [k for k in (pts[0].keys() if pts else []) if k not in POINT_FIELDS]
@@ -288,11 +337,16 @@ class _Worker(QtCore.QThread):
     def _prepare_scope(self, s):
         for ch in (1, 2):
             self.scope.set_ch_display(ch, True)
+            if s.auto_v:
+                # 垂直位置的單位是伏特：不歸零的話，波形會被位置推到螢幕邊緣，自動刻度就不敢縮小，
+                # 縮小後波形也會跑出螢幕外。
+                self.scope.set_position(ch, 0.0)
             if s.auto_ac:
                 self.scope.set_coupling(ch, "AC")
                 self.scope.set_bwlimit(ch, False)
         if s.scope_avg > 1:
             self.scope.set_acquire_average(s.scope_avg)
+        time.sleep(0.5)                 # 讓示波器套用新設定，避免第一點讀到舊波形
 
     def _finish(self, s, stopped):
         if s.scope_avg > 1:
@@ -344,7 +398,8 @@ class SweepWorker(_Worker):
             self._finish(s, stopped)
         if pts and not analyses:
             analyses = analyze_points(pts, s.L)
-        self.result.emit(dict(points=pts, analyses=analyses, warning=amplitude_check(pts), settings=s))
+        self.result.emit(dict(points=pts, analyses=analyses, warning=amplitude_check(pts) if s.scope_avg <= 1 else None,
+                                settings=s))
 
 
 class BatchWorker(_Worker):
@@ -402,7 +457,7 @@ class BatchWorker(_Worker):
                 pts, analyses = run_resonance_sweep(
                     meas, s, extra, self._on_point,
                     lambda m, i=idx, v=val: self.status.emit(f"[{i + 1}/{len(self.values)}] {name} {v:g} {unit}：{m}"))
-                warn = amplitude_check(pts)
+                warn = amplitude_check(pts) if s.scope_avg <= 1 else None
                 if warn:
                     warnings.append(f"{name} {val:g} {unit}：{warn}")
                 fname = os.path.join(self.outdir, f"{self.kind}_{val:g}{unit}.csv")
@@ -452,16 +507,29 @@ class BifSettings:
     amp_stop: float = 4.0
     steps: int = 40
     settle: float = 1.0
-    record_length: int = 10000
+    record_length: int = config.BIF_RECORD_LENGTH
+    n_frames: int = 1             # 每個振幅擷取幾張（A：取樣值合併判斷、B：功率頻譜平均）
     min_periods: int = 100
     method: str = "max"          # "max" / "phase"
     phase_deg: float = 0.0
     phase_ref: str = "ch2"       # "ch2" = 以 CH2 基頻波峰為相位 0（自動）；"ch1" = 以 CH1 驅動波峰為相位 0
     tol: float = config.BIF_TOL
+    max_period: int = config.BIF_MAX_PERIOD
+    chaos_method: str = config.BIF_CHAOS_METHOD
     stop_action: str = "keep"
 
     def amps(self):
         return np.linspace(self.amp_start, self.amp_stop, max(int(self.steps), 1))
+
+    def periods(self):
+        return tuple(p for p in config.BIF_PERIODS if p <= self.max_period)
+
+    def pow2_divs(self):
+        """要鎖相記錄的次諧波 f/2、f/4、…（到最高判斷週期，至少到 f/8）。"""
+        return tuple(q for q in POW2_ORDERS if q <= max(self.max_period, 8))
+
+    def cycles_needed(self):
+        return max(int(self.min_periods), config.BIF_CYCLES_PER_PERIOD * int(self.max_period))
 
 
 class BifurcationWorker(_Worker):
@@ -477,7 +545,7 @@ class BifurcationWorker(_Worker):
             w1, w2 = meas.acquire()
             changed = False
             for ch, w in ((1, w1), (2, w2)):
-                new = suggest_vscale(w, VOLT_SCALES, config.SCREEN_HALF_DIVS)
+                new = suggest_vscale(w, VOLT_SCALES, config.SCREEN_HALF_DIVS, fill=config.BIF_SCALE_FILL)
                 if new is not None:
                     self.scope.set_ch_scale(ch, new)
                     changed = True
@@ -500,33 +568,92 @@ class BifurcationWorker(_Worker):
                 bench.chaos = True
             for ch in (1, 2):
                 self.scope.set_ch_display(ch, True)
+                self.scope.set_position(ch, 0.0)       # 見 _prepare_scope 的說明
+                self.scope.set_bwlimit(ch, config.BIF_BWLIMIT)
             self.scope.set_record_length(b.record_length)
-            self.tscale = pick_scale(TIME_SCALES, b.min_periods / (10 * b.freq))
+            need = b.cycles_needed()      # 最高判斷週期越高，需要越多週期（f/p 譜線才分得開）
+            self.tscale = pick_scale(TIME_SCALES, need / (10 * b.freq))
             self.scope.set_timebase(self.tscale)
             spp = b.record_length / (10 * self.tscale * b.freq)
-            self.status.emit(f"時基 {fmt_eng(self.tscale, 's')}/div，畫面約 {10 * self.tscale * b.freq:.0f} 個週期，"
-                             f"每週期約 {spp:.0f} 點" + ("（點數偏少，建議加大記錄長度）" if spp < 20 else ""))
+            self.status.emit(f"時基 {fmt_eng(self.tscale, 's')}/div，畫面約 {10 * self.tscale * b.freq:.0f} 個週期"
+                             + (f"（判斷到週期 {b.max_period} 需要 {need} 個）" if need > b.min_periods else "")
+                             + f"，每週期約 {spp:.0f} 點" + ("（點數偏少，建議加大記錄長度）" if spp < 20 else ""))
             self.afg.set_frequency(b.freq)
             self.afg.set_output(True)
             amps = b.amps()
+
+            def one(a):
+                self.afg.set_amplitude(float(a))
+                meas.wait(b.settle + 20 * self.tscale)
+                w1, w2 = self._acquire(meas)
+                # 多張擷取（刻度已調好，之後不再改）：每張各自處理，不把波形疊起來平均（會抵消倍週期）
+                frames = [(w1, w2)]
+                for _ in range(max(int(b.n_frames), 1) - 1):
+                    meas.wait(0.05 + 20 * self.tscale)
+                    frames.append(meas.acquire())
+                good = [fr for fr in frames if not (fr[0].incomplete or fr[1].incomplete)
+                        and len(fr[1].v) == len(w2.v)]
+                incomplete = not good
+                if good:
+                    frames = good
+                w1, w2 = frames[0]
+
+                def refof(fr):
+                    return (fr[1].t, fr[1].v) if b.phase_ref == "ch2" else (fr[0].t, fr[0].v)
+
+                ref = refof(frames[0])
+                # A：每週期取樣值 = 所有張合在一起（畫圖用；週期判斷時各張分開比較）
+                seqs = [per_cycle_values(fr[1].t, fr[1].v, b.freq, b.method, b.phase_deg, ref=refof(fr))
+                        for fr in frames]
+                vals = np.concatenate(seqs)
+                scale = float(np.median([vpp(fr[1].v) for fr in frames]))
+                # 最大 Lyapunov 指數：用畫圖的那一串每週期取樣值（各張分開演化）
+                ly = lyapunov_kantz(seqs, scale, tol=b.tol, shell=config.BIF_LYAP_SHELL, dim=config.BIF_LYAP_DIM,
+                                    max_sat=config.BIF_LYAP_MAX_SAT)
+                # 週期判斷：多相位時域 + 頻譜確認；多張時，時域合併各張、頻譜做功率平均（B）；混沌用 λ 判斷
+                cls = classify_period(w2.t, w2.v, b.freq, ref=ref, tol=b.tol, sub_dbc=config.BIF_SUB_DBC,
+                                      confirm_db=config.BIF_CONFIRM_DB, chaos_db=config.BIF_CHAOS_DB,
+                                      n_phases=config.BIF_PHASES, chaos_floor_dbc=config.BIF_CHAOS_FLOOR_DBC,
+                                      periods=b.periods(), extra_frames=[(fr[1].v, refof(fr)) for fr in frames[1:]],
+                                      lyap=ly["lyap"] if ly["valid"] else float("nan"), lyap_thr=config.BIF_LYAP_THR,
+                                      chaos_method=b.chaos_method, weak_upgrade=config.BIF_WEAK_UPGRADE)
+                p = cls["period"]
+                subs = [subharmonic_dbc(fr[1].t, fr[1].v, b.freq, divs=b.pow2_divs()) for fr in frames]
+                sub = {k: 10 * math.log10(np.mean([10 ** (s[k] / 10) for s in subs if np.isfinite(s[k])]))
+                       if any(np.isfinite(s[k]) for s in subs) else float("nan") for k in subs[0]}
+                return dict(amp=float(a), values=vals, branches=branch_stats(seqs, p), period=p, label=period_label(p),
+                            sub=sub, ch2_vpp=scale, cls=cls, lyap=ly["lyap"], lyap_n=ly["n_ref"],
+                            lyap_valid=ly["valid"], lyap_sat=ly["sat"],
+                            spec=spectrum_map_row(w2.t, [fr[1].v for fr in frames], b.freq),
+                            ch1_vpp=vpp(w1.v), n_cycles=len(vals), n_frames=len(frames), t=w2.t, v=w2.v,
+                            incomplete=incomplete, redone=False)
+
             for i, a in enumerate(amps):
                 if self._stop:
                     raise StopRequested
-                self.afg.set_amplitude(float(a))
                 self.status.emit(f"振幅 {a:.4g} Vpp（{i + 1}/{len(amps)}）")
-                meas.wait(b.settle + 20 * self.tscale)
-                w1, w2 = self._acquire(meas)
-                ref = (w2.t, w2.v) if b.phase_ref == "ch2" else (w1.t, w1.v)
-                vals = per_cycle_values(w2.t, w2.v, b.freq, b.method, b.phase_deg, ref=ref)
-                scale = vpp(w2.v)
-                p = detect_period(vals, scale, b.tol)
-                sub = subharmonic_dbc(w2.t, w2.v, b.freq)
-                r = dict(amp=float(a), values=vals, period=p, label=period_label(p), sub=sub, ch2_vpp=scale,
-                         ch1_vpp=vpp(w1.v), n_cycles=len(vals), t=w2.t, v=w2.v)
+                r = one(a)
                 results.append(r)
                 self.amp_done.emit(r)
                 self.progress.emit(i + 1, len(amps))
-            self.status.emit("分岔圖完成")
+
+            # 補測資料不完整的振幅：先回到前一個振幅再升上來，保持「由小往大」的掃描歷程
+            for rnd in range(config.REDO_ROUNDS if config.AUTO_REDO_INCOMPLETE else 0):
+              bad = [i for i, r in enumerate(results) if r["incomplete"]]
+              if not bad:
+                  break
+              for k, i in enumerate(bad):
+                if self._stop:
+                    raise StopRequested
+                self.status.emit(f"補測資料不完整的振幅 {amps[i]:.4g} Vpp（{k + 1}/{len(bad)}）")
+                self.afg.set_amplitude(float(amps[max(i - 1, 0)]))
+                meas.wait(b.settle + 20 * self.tscale)
+                r = one(amps[i])
+                r["redone"], r["redo_of"] = True, i
+                results[i] = r
+                self.amp_done.emit(r)
+            still = sum(r["incomplete"] for r in results)
+            self.status.emit("分岔圖完成" + (f"（補測後仍有 {still} 個振幅資料不完整）" if still else ""))
         except StopRequested:
             stopped = True
             self.status.emit("已停止")
@@ -548,8 +675,46 @@ class BifurcationWorker(_Worker):
         self.result.emit(dict(results=results, settings=b))
 
 
-def write_bifurcation_csv(base, results, b, meta_lines):
-    """base.csv：每個週期的取樣值（長格式）；base_summary.csv：每個振幅的週期判斷與 f/2、f/4 分量。"""
+EXTRA_SPEC = (12, 16, 32, 64, 128)     # summary CSV 後面追加的頻譜譜線欄位
+
+
+def _cls_cols(c):
+    """summary CSV 的週期判斷細節欄位（classify_period 的結果）。"""
+    if not c:
+        return [""] * (11 + len(EXTRA_SPEC))
+    L = c["lines"]
+    g = lambda k: f"{L.get(k, float('nan')):.2f}"
+    return [c["p_time"], c["p_spec"], g("f/2"), g("f/4"), g("f/8"),
+            f"{c['floor']:.2f}", f"{c['floor_hf']:.2f}", c["reason"],
+            g("f/3"), g("f/5"), g("f/6")] + [g(f"f/{q}") for q in EXTRA_SPEC]
+
+
+def bif_feigenbaum(results, b):
+    """分岔圖結果 → 費根鮑姆分析（analysis.feigenbaum_analysis）。依振幅排序；次諧波用鎖相值。"""
+    rs = sorted(results, key=lambda r: r["amp"])
+    if len(rs) < 3:
+        return None
+    amps = [r["amp"] for r in rs]
+    per = [r["period"] for r in rs]
+    lev = {q: np.array([r["sub"].get(f"f/{q}", float("nan")) for r in rs]) for q in b.pow2_divs()}
+    return feigenbaum_analysis(amps, per, lev, gates=config.BIF_FEIG_GATES, nfit=config.BIF_FEIG_NFIT)
+
+
+def write_bifurcation_csv(base, results, b, meta_lines, feig=None):
+    """base.csv：每個週期的取樣值（長格式）；base_summary.csv：每個振幅的週期判斷、次諧波、Lyapunov 指數；
+    base_branches.csv：每個振幅、每個分支的平均 ± 標準差 / 標準誤（週期 p 有 p 列；混沌與無法判斷不列）；
+    base_spectra.npz：每個振幅的平均功率頻譜（amp_Vpp、f_over_fdrive、dBc[振幅, 頻率]）；
+    base_feigenbaum.txt：倍週期閾值與費根鮑姆常數（feig = bif_feigenbaum 的結果）。"""
+    specs = [r for r in results if r.get("spec") is not None]
+    if specs:
+        np.savez_compressed(base + "_spectra.npz", amp_Vpp=np.array([r["amp"] for r in specs]),
+                            f_over_fdrive=SPEC_GRID, dBc=np.array([r["spec"] for r in specs]))
+    if feig is not None:
+        with open(base + "_feigenbaum.txt", "w", encoding="utf-8-sig") as fp:
+            for line in meta_lines:
+                fp.write(line + "\n")
+            fp.write(f"# 驅動頻率,{b.freq:.9g} Hz；混沌判斷 = {b.chaos_method}（λ 門檻 {config.BIF_LYAP_THR:g}）\n\n")
+            fp.write(feig["text"] + "\n")
     head = meta_lines + ["# 分岔圖設定," + "；".join(f"{k}={v}" for k, v in asdict(b).items()),
                          "# 取樣方式," + ("每週期最大值" if b.method == "max" else f"固定相位 {b.phase_deg:g}°")
                          + ("（相位 0 = CH2 基頻波峰）" if b.phase_ref == "ch2" else "（相位 0 = CH1 驅動波峰）")]
@@ -564,9 +729,34 @@ def write_bifurcation_csv(base, results, b, meta_lines):
     with open(base + "_summary.csv", "w", newline="", encoding="utf-8-sig") as fp:
         for line in head:
             fp.write(line + "\n")
-        fp.write("# period = 0 表示混沌或無法判斷\n")
+        fp.write("# period：多相位時域判斷 + 頻譜確認（analysis.classify_period）；0 = 混沌"
+                 f"（判斷方式 {b.chaos_method}），-1 = 雜訊太大無法判斷\n")
+        fp.write("# p_time = 時域判斷，p_spec = 頻譜判斷，spec_* = Hann FFT 的譜線/底噪 (dBc)；f/2_dBc、f/4_dBc 為鎖相值\n")
+        fp.write("# lyapunov = 最大 Lyapunov 指數（每驅動週期，自然對數；analysis.lyapunov_kantz），"
+                 "lyap_n_ref = 有鄰居的參考點數，lyap_sat = 鄰居一步分開的程度（> "
+                 f"{config.BIF_LYAP_MAX_SAT:g} 視為雜訊，lyap_valid = 0，不用來判斷混沌）；f/8_dBc 之後為鎖相值\n")
+        divs = [q for q in b.pow2_divs() if q > 4]
         wr = csv.writer(fp)
-        wr.writerow(["amp_Vpp", "period", "label", "f/2_dBc", "f/4_dBc", "CH1_Vpp", "CH2_Vpp", "n_cycles"])
+        wr.writerow(["amp_Vpp", "period", "label", "f/2_dBc", "f/4_dBc", "CH1_Vpp", "CH2_Vpp", "n_cycles", "incomplete", "redone",
+                     "p_time", "p_spec", "spec_f2_dBc", "spec_f4_dBc", "spec_f8_dBc", "floor_dBc", "floor_hf_dBc", "judge",
+                     "spec_f3_dBc", "spec_f5_dBc", "spec_f6_dBc"] + [f"spec_f{q}_dBc" for q in EXTRA_SPEC]
+                    + ["lyapunov", "lyap_n_ref", "lyap_sat", "lyap_valid"] + [f"f/{q}_dBc" for q in divs])
         for r in results:
             wr.writerow([f"{r['amp']:.6g}", r["period"], r["label"], f"{r['sub']['f/2']:.2f}",
-                         f"{r['sub']['f/4']:.2f}", f"{r['ch1_vpp']:.6g}", f"{r['ch2_vpp']:.6g}", r["n_cycles"]])
+                         f"{r['sub']['f/4']:.2f}", f"{r['ch1_vpp']:.6g}", f"{r['ch2_vpp']:.6g}", r["n_cycles"],
+                         int(r.get("incomplete", False)), int(r.get("redone", False))]
+                        + _cls_cols(r.get("cls"))
+                        + [f"{r.get('lyap', float('nan')):.4f}", r.get("lyap_n", 0),
+                           f"{r.get('lyap_sat', float('nan')):.3f}", int(r.get("lyap_valid", False))]
+                        + [f"{r['sub'].get(f'f/{q}', float('nan')):.2f}" for q in divs])
+    with open(base + "_branches.csv", "w", newline="", encoding="utf-8-sig") as fp:
+        for line in head:
+            fp.write(line + "\n")
+        fp.write("# 週期 p 的每週期取樣值分成 p 個分支（第 i 個週期屬於分支 i mod p，多張以循環平移對齊），"
+                 "branch 依平均值由小到大編號；std = 樣本標準差，sem = std/√n\n")
+        wr = csv.writer(fp)
+        wr.writerow(["amp_Vpp", "period", "label", "branch", "mean_V", "std_V", "sem_V", "n"])
+        for r in results:
+            for k, br in enumerate(r.get("branches") or []):
+                wr.writerow([f"{r['amp']:.6g}", r["period"], r["label"], k, f"{br['mean']:.6g}", f"{br['std']:.6g}",
+                             f"{br['sem']:.6g}", br["n"]])

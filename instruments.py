@@ -52,6 +52,19 @@ class Waveform:
     dt: float                # 取樣間隔 (s)
     header: dict = field(default_factory=dict)
     vpos: float = 0.0        # 垂直位置偏移 (V)；螢幕上的位置 = (v + vpos) / vscale
+    missing_bytes: int = 0   # >0 表示資料不完整（傳輸中遺失一整塊），缺口後的取樣點時間會錯位
+
+    @property
+    def incomplete(self):
+        return self.missing_bytes > 0
+
+
+class PartialReadError(TimeoutError):
+    """資料只收到一部分；data 是已收到的位元組。"""
+
+    def __init__(self, msg, data=b"", expected=0):
+        super().__init__(msg)
+        self.data, self.expected = data, expected
 
 
 def _first_float(text):
@@ -119,7 +132,7 @@ class SerialInstrument:
         while len(buf) < n:
             chunk = self.ser.read(n - len(buf))
             if not chunk:
-                raise TimeoutError(f"{self.port} 資料傳輸逾時（收到 {len(buf)}/{n} bytes）")
+                raise PartialReadError(f"{self.port} 資料傳輸逾時（收到 {len(buf)}/{n} bytes）", bytes(buf), n)
             buf += chunk
         return bytes(buf)
 
@@ -148,21 +161,45 @@ class GDS1000B(SerialInstrument):
     def setup(self):
         self.set_record_length(config.RECORD_LENGTH)
 
-    def read_raw(self, ch):
-        """送出讀波形指令，回傳 (標頭 bytes, 資料 bytes)。"""
-        with self.lock:
-            self.write(config.WAVEFORM_QUERY.format(ch=ch))
-            head = self.ser.read_until(b"#")
-            if not head.endswith(b"#"):
-                raise TimeoutError(f"讀 CH{ch} 波形逾時，收到：{head[:80]!r}")
-            n = int(self._read_exact(1))
-            length = int(self._read_exact(n))
-            data = self._read_exact(length)
-            self._drain()
-        return head[:-1], data
+    retry_count = 0          # 累計重試次數（給介面或腳本觀察發生頻率）
+
+    def read_raw(self, ch, retries=None):
+        """送出讀波形指令，回傳 (標頭 bytes, 資料 bytes)。
+        GDS-1072B（V1.21）在 STOP 狀態下讀記憶體，偶爾會整塊少 511/1023 bytes（2026-10-21 實測約 5–20%/次）。
+        STOP 時記憶體內容不變，所以失敗就清掉殘留資料、重讀同一通道，仍是同一次擷取。"""
+        retries = config.WAVEFORM_RETRIES if retries is None else retries
+        last, best = None, None          # best：收到最多的那次 (head, data, 缺少的 bytes)
+        for attempt in range(retries + 1):
+            head = b""
+            try:
+                with self.lock:
+                    self.write(config.WAVEFORM_QUERY.format(ch=ch))
+                    head = self.ser.read_until(b"#")
+                    if not head.endswith(b"#"):
+                        raise TimeoutError(f"讀 CH{ch} 波形逾時，收到：{head[:80]!r}")
+                    n = int(self._read_exact(1))
+                    length = int(self._read_exact(n))
+                    data = self._read_exact(length)
+                    self._drain()
+                return head[:-1], data, 0
+            except (TimeoutError, ValueError) as e:     # ValueError：長度欄位被殘留資料弄亂
+                last = e
+                if isinstance(e, PartialReadError) and e.expected > 1000 and head.endswith(b"#"):
+                    miss = e.expected - len(e.data)
+                    if best is None or miss < best[2]:
+                        best = (head[:-1], e.data, miss)
+                self._drain(0.3)
+                if attempt < retries:
+                    self.retry_count += 1
+                    print(f"[{self.port}] CH{ch} 讀取失敗（{e}），重試第 {attempt + 1} 次", flush=True)
+        # 全部重試都失敗：允許的話，回傳收到最多的那份（標記為不完整），讓量測繼續；至少要收到一半
+        if config.WAVEFORM_ALLOW_PARTIAL and best is not None and best[2] <= len(best[1]):
+            print(f"[{self.port}] CH{ch} 重試後仍不完整，先使用部分資料（少 {best[2]} bytes）", flush=True)
+            return best
+        raise last
 
     def read_waveform(self, ch):
-        head, data = self.read_raw(ch)
+        head, data, missing = self.read_raw(ch)
         header = parse_header(head)
         dtype = np.dtype(config.DATA_DTYPE)
         data = data[: len(data) // dtype.itemsize * dtype.itemsize]
@@ -180,7 +217,7 @@ class GDS1000B(SerialInstrument):
             v = raw / config.COUNTS_PER_DIV * vscale
             screen_div = (v + vpos) / vscale
         t = (np.arange(n) - n / 2) * dt
-        return Waveform(ch, t, v, screen_div, vscale, dt, header, vpos)
+        return Waveform(ch, t, v, screen_div, vscale, dt, header, vpos, missing)
 
     def measure(self, ch, item):
         """item 例如 'PK2PK'、'FREQuency'、'AMPlitude'、'MEAN'。"""
@@ -214,6 +251,13 @@ class GDS1000B(SerialInstrument):
 
     def set_ch_display(self, ch, on):
         self.write(f":CHANnel{ch}:DISPlay {'ON' if on else 'OFF'}")
+
+    def set_position(self, ch, volt):
+        """垂直位置（單位：伏特）。"""
+        self.write(f":CHANnel{ch}:POSition {volt:.4e}")
+
+    def get_position(self, ch):
+        return self.query_float(f":CHANnel{ch}:POSition?")
 
     def set_coupling(self, ch, mode):
         """mode：'AC'、'DC' 或 'GND'。"""
@@ -297,20 +341,38 @@ class AFG2100(SerialInstrument):
     def get_frequency(self):
         return self.query_float("SOUR1:FREQ?")
 
+    def _query_factor(self):
+        """AFG-2112（韌體 V2.04）實測：負載設 High-Z 時，設定值正確，但 AMPL? / DCO? 回傳的是
+        50 Ω 等效值（實際的一半）。這裡乘回來，讓讀到的值和實際輸出一致。"""
+        if config.AFG_HIGHZ_QUERY_HALF:
+            try:
+                return 2.0 if self.get_load() else 1.0
+            except Exception:
+                return 1.0
+        return 1.0
+
     def get_amplitude(self):
-        v = self.query_float("SOUR1:AMPL?")
+        v = self.query_float("SOUR1:AMPL?") * self._query_factor()
         if np.isfinite(v):
             self._amp = v
         return v
 
     def get_offset(self):
-        v = self.query_float("SOUR1:DCO?")
+        v = self.query_float("SOUR1:DCO?") * self._query_factor()
         if np.isfinite(v):
             self._off = v
         return v
 
     def error(self):
         return self.query("SYST:ERR?")
+
+    def check_error(self):
+        """讀錯誤佇列；沒有錯誤回傳 None，有錯誤回傳錯誤字串（例如 -222 Data out of range）。"""
+        try:
+            r = self.error()
+        except Exception:
+            return None
+        return None if ("NO ERROR" in r.upper() or r.strip().startswith(("+0", "0"))) else r
 
 
 GW_INSTEK_VID = 0x2184
@@ -409,8 +471,9 @@ class SimBench:
         k = np.arange(1, kmax + 1)
         return k, 2 / np.pi * (-1.0) ** (k + 1) / k
 
-    def _chaos_env(self, t, ph):
-        """每個週期一個振幅係數（logistic map），振幅越大越接近混沌。週期交界在正弦過零處，波形連續。"""
+    def _chaos_env(self, t, ph, smooth=False):
+        """每個週期一個振幅係數（logistic map），振幅越大越接近混沌。週期交界在正弦過零處，波形連續。
+        smooth=True：改成在各週期中心之間線性內插（連續、每個相位都隨週期變化）。"""
         a0, a1 = config.SIM_CHAOS_RANGE_VPP
         r = 2.8 + 1.2 * float(np.clip((self.amp - a0) / (a1 - a0), 0, 1))
         cyc = np.floor((2 * np.pi * self.freq * t + ph) / (2 * np.pi)).astype(int)
@@ -422,6 +485,9 @@ class SimBench:
         for i in range(n):
             x = r * x * (1 - x)
             xs[i] = x
+        if smooth:
+            pos = (2 * np.pi * self.freq * t + ph) / (2 * np.pi)
+            return 0.5 + np.interp(pos, c0 + np.arange(n) + 0.5, xs)
         return 0.5 + xs[cyc - c0]
 
     def signal(self, t, ch, include_dc=True):
@@ -433,7 +499,16 @@ class SimBench:
         phase = 2 * np.pi * self.freq * np.outer(t, k) + np.angle(h)
         x = (np.sin(phase) * (a * np.abs(h))).sum(axis=1) * self.amp / 2 * voc
         if ch == 2 and self.chaos and self.func == "SIN":
-            x = x * self._chaos_env(t, float(np.angle(h[0])))
+            ph = float(np.angle(h[0]))
+            state = self.rng.integers(1 << 30)
+            self.rng = np.random.default_rng(state)
+            env = self._chaos_env(t, ph)
+            self.rng = np.random.default_rng(state)       # 同一串 logistic 數列
+            drift = self._chaos_env(t, ph, smooth=True) - 1
+            # 只乘包絡的話，過零點固定不動，那個相位每週期取樣值都是 0（會被當成週期 1）；
+            # 再加一個隨週期平滑變化的偏移，讓每個相位都跟著 logistic 數列變
+            amp1 = self.amp / 2 * voc * float(np.abs(h[0]))
+            x = x * env + amp1 * drift
         dc_gain = 1.0 if ch == 1 or config.SIM_MODEL == "rc" else 0.0   # 電容擋直流
         return x + (self.offset * voc * dc_gain if include_dc else 0.0)
 
@@ -561,6 +636,12 @@ class SimScope(_SimBase):
 
     def set_ch_display(self, ch, on):
         pass
+
+    def set_position(self, ch, volt):
+        pass
+
+    def get_position(self, ch):
+        return 0.0
 
     def set_coupling(self, ch, mode):
         self.coupling[ch] = mode
